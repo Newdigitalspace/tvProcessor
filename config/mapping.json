@@ -1,0 +1,14 @@
+{
+  "fields": [
+    { "key": "type", "label": "Type" },
+    { "key": "sec_type", "label": "Sec type" },
+    { "key": "action", "label": "Action" },
+    { "key": "volume", "label": "Volume" },
+    { "key": "order_price", "label": "Order price" },
+    { "key": "order_id", "label": "Order id" },
+    { "key": "market_position", "label": "Market position" },
+    { "key": "prev_market_position", "label": "Prev position" },
+    { "key": "time", "label": "Time", "format": "iso" },
+    { "key": "comment", "label": "Comment" }
+  ]
+}
