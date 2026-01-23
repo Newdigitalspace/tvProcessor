@@ -1,0 +1,347 @@
+/**
+ * POC: TradingView email -> exact screenshot of TradingView email BODY (+ watermark) -> send inline image
+ *
+ * ✅ Uses SAME labels as your original flow:
+ *    - SOURCE_LABEL: emails to process
+ *    - DONE_LABEL: mark processed
+ *
+ * ✅ No GitHub templates/config in this POC.
+ * ✅ Handles forwarded emails by extracting the TradingView block out of nested quotes.
+ *
+ * REQUIREMENTS (one-time setup you do manually):
+ * 1) Deploy this script as a Web App (needed because ScreenshotMachine screenshots a URL):
+ *    - Deploy > New deployment > Type: Web app
+ *    - Execute as: Me
+ *    - Who has access: Anyone
+ *    - Copy the Web app URL and paste into WEB_APP_URL below
+ *
+ * 2) Add a time-driven trigger for tradingViewScreenshotPOC() (every 1–5 min)
+ * 3) Put your ScreenshotMachine credentials in SCRIPT PROPERTIES (safer than hardcoding):
+ *    - Project Settings > Script properties:
+ *      SM_KEY = <your key>
+ *      SM_SECRET = <your secret phrase>
+ *      WM_TEXT = <watermark text>   (optional, defaults to "TIMEWAVES TRADING")
+ *      WEB_TOKEN = <random token>   (optional but recommended)
+ *
+ * NOTE:
+ * - This sends a *separate* email with the inline screenshot.
+ * - It does NOT alter the original TradingView email (credibility stays).
+ * - Requiers ImgAPP library and Drive and Slider API service. 
+ */
+
+// === Labels (same as your original) ===
+const SOURCE_LABEL = "TV_ALERTS";
+const DONE_LABEL   = "TV_PROCESSED";
+
+// === Recipient(s) for screenshot email (POC: hardcode here) ===
+const RECIPIENTS = "newbuttonsprocesser@gmail.com"; // can be group or comma-separated
+
+// === Your sender display name ===
+const SENDER_NAME = "TimeWaves Trading";
+
+// === Paste your deployed Web App URL here (ends with /exec) ===
+const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwetsmlyoAVg8pRLZJNDPjoQx3sIxx9vujNBPQwh4D_XENJFgCG1mecdXkYbNyal4ndbg/exec"; // e.g. https://script.google.com/macros/s/XXXXX/exec
+
+
+/**
+ * Main processor: run via time-driven trigger.
+ */
+function tradingViewScreenshotPOC() {
+    Logger.log("Start run");
+  if (!WEB_APP_URL || WEB_APP_URL.includes("PASTE_YOUR_WEB_APP_URL_HERE")) {
+    throw new Error("Set WEB_APP_URL to your deployed web app /exec URL.");
+  }
+
+  const secrets = getSecrets_();
+
+  const src = GmailApp.getUserLabelByName(SOURCE_LABEL);
+  if (!src) throw new Error(`Label not found: ${SOURCE_LABEL}`);
+
+  const done = GmailApp.getUserLabelByName(DONE_LABEL) || GmailApp.createLabel(DONE_LABEL);
+
+  const threads = src.getThreads(0, 20);
+  Logger.log("Threads found: " + threads.length);
+  for (const thread of threads) {
+    Logger.log("Processing thread subject: " + thread.getFirstMessageSubject());
+    if (thread.getLabels().some(l => l.getName() === DONE_LABEL)) continue;
+
+    const msg = thread.getMessages().slice(-1)[0];
+    const subject = msg.getSubject();
+
+    // 1) Get full HTML body from Gmail (may include forward wrappers)
+    const fullHtml = msg.getBody();
+
+    // 2) Extract TradingView block (best effort)
+    const tvBlock = extractTradingViewBlock_(fullHtml) || fullHtml;
+
+    // 3) Wrap + add watermark
+    const wrapped = wrapForScreenshot_(tvBlock, secrets.wmText);
+
+    // 4) Store wrapped HTML as a Drive file so our Web App can serve it to ScreenshotMachine
+    const htmlFileId = saveHtmlToDrive_(wrapped, subject);
+
+    // 5) Build the render URL that ScreenshotMachine will screenshot
+    const renderUrl = buildRenderUrl_(htmlFileId, secrets.webToken);
+
+    // 6) Build ScreenshotMachine URL with hash = md5(url + secretPhrase)
+    const smUrl = buildScreenshotMachineUrl_(renderUrl, secrets.smKey, secrets.smSecret);
+
+    Logger.log(smUrl);
+
+// 7) Fetch image
+let imageBlob;
+try {
+  const resp = UrlFetchApp.fetch(smUrl, { muteHttpExceptions: true, followRedirects: true });
+  const code = resp.getResponseCode();
+  Logger.log("ScreenshotMachine HTTP: " + code);
+
+  if (code < 200 || code >= 300) {
+    Logger.log("Body: " + resp.getContentText().slice(0, 300));
+    throw new Error("ScreenshotMachine non-2xx");
+  }
+
+  imageBlob = resp.getBlob().setName("tradingview-alert.png");
+  Logger.log("Blob contentType: " + imageBlob.getContentType() + " size=" + imageBlob.getBytes().length);
+
+  // Try crop, but DON'T block sending if crop fails
+  try {
+    imageBlob = cropTopPx_(imageBlob);
+    Logger.log("Crop OK");
+  } catch (cropErr) {
+    Logger.log("Crop FAILED (sending original): " + cropErr);
+  }
+
+} catch (e) {
+  Logger.log("Fetch FAILED: " + e);
+  continue;
+}
+
+
+    // 8) Send screenshot inline
+    GmailApp.sendEmail(
+      RECIPIENTS,
+      `TradingView Alert (Screenshot): ${subject}`,
+      "TradingView alert screenshot (inline).",
+      {
+        name: SENDER_NAME,
+        htmlBody: `
+          <div style="font-family:Arial,sans-serif">
+            <p style="margin:0 0 10px 0;">TradingView alert screenshot:</p>
+            <img src="cid:tvshot" style="max-width:100%; border:1px solid #eee; border-radius:8px;" />
+          </div>
+        `,
+        inlineImages: { tvshot: imageBlob }
+      }
+    );
+
+    // 9) Mark done + remove source label
+    //done.addToThread(thread);
+    //src.removeFromThread(thread);
+
+    // Optional cleanup: if you want to delete the HTML file after screenshot, uncomment:
+    // DriveApp.getFileById(htmlFileId).setTrashed(true);
+  }
+}
+
+/**
+ * Web App endpoint: serves stored HTML for ScreenshotMachine to screenshot.
+ * Deploy as Web app: Execute as Me, access Anyone.
+ *
+ * URL pattern:
+ *   WEB_APP_URL?fileId=<drive-file-id>&token=<token>
+ */
+function doGet(e) {
+  const secrets = getSecrets_();
+
+  const fileId = (e && e.parameter && e.parameter.fileId) ? e.parameter.fileId : "";
+  const token  = (e && e.parameter && e.parameter.token)  ? e.parameter.token  : "";
+
+  // Token gate (recommended). If WEB_TOKEN isn't set, allow access (POC).
+  if (secrets.webToken && token !== secrets.webToken) {
+    return HtmlService.createHtmlOutput("Forbidden").setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  if (!fileId) {
+    return HtmlService.createHtmlOutput("Missing fileId").setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  const html = DriveApp.getFileById(fileId).getBlob().getDataAsString("UTF-8");
+  return HtmlService
+    .createHtmlOutput(html)
+    // Allow embedding/screenshot tools
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/* =========================
+   Helpers
+   ========================= */
+
+function cropTopPx_(pngBlob) {
+  const out = ImgApp.editImage({
+    blob: pngBlob,
+    unit: "pixel",    
+    crop: { t: 80, b: 100, l: 50, r: 50 },
+    //outputWidth: 600 // keep output width stable (match your screenshot width)
+  });
+  return out.setName(pngBlob.getName() || "cropped.png");
+}
+
+
+function getSecrets_() {
+  const props = PropertiesService.getScriptProperties();
+
+  const smKey = props.getProperty("SM_KEY") || "";
+  const smSecret = props.getProperty("SM_SECRET") || "";
+  const wmText = props.getProperty("WM_TEXT") || "TIMEWAVES TRADING";
+  const webToken = props.getProperty("WEB_TOKEN") || ""; // recommended
+
+  if (!smKey || !smSecret) {
+    throw new Error("Missing SM_KEY / SM_SECRET in Script Properties.");
+  }
+
+  return { smKey, smSecret, wmText, webToken };
+}
+
+function buildRenderUrl_(fileId, token) {
+  const t = token ? `&token=${encodeURIComponent(token)}` : "";
+  return `${WEB_APP_URL}?fileId=${encodeURIComponent(fileId)}${t}`;
+}
+
+function buildScreenshotMachineUrl_(renderUrl, key, secretPhrase) {
+  // ScreenshotMachine hash = md5(url + secretPhrase)
+  const hash = md5_(renderUrl + secretPhrase);
+
+  // IMPORTANT: renderUrl must be URL-encoded inside the ScreenshotMachine URL.
+  // === ScreenshotMachine settings ===
+//const SM_DIMENSION = "1024x768"; // can tweak. ScreenshotMachine will do full page for long pages as it scrolls.
+  const SM_DIMENSION = "768x950"; // can tweak. ScreenshotMachine will do full page for long pages as it scrolls.
+  const SM_CROP = "0,0,768,900"
+  const SM_DEVICE = "mobile"
+  const encodedUrl = encodeURIComponent(renderUrl);
+  const SELECTOR = encodeURIComponent("#capture");
+  const HIDESEL = encodeURIComponent('td > a[href*="www.tradingview"]');
+
+  return `https://api.screenshotmachine.com/?key=${encodeURIComponent(key)}&url=${encodedUrl}&dimension=${encodeURIComponent(SM_DIMENSION)}&device=${encodeURIComponent(SM_DEVICE)}&crop=${encodeURIComponent(SM_CROP)}&hash=${hash}`;
+}
+
+function md5_(s) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s, Utilities.Charset.UTF_8);
+  return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
+/**
+ * Extract the TradingView block from forwarded/quoted email HTML.
+ * Heuristic: locate TradingView logo marker and capture from nearest <table> before it.
+ */
+function extractTradingViewBlock_(fullHtml) {
+  if (!fullHtml) return null;
+
+  const marker = "tradingview-logo.png";
+  const idx = fullHtml.indexOf(marker);
+  if (idx === -1) return null;
+
+  const tableStart = fullHtml.lastIndexOf("<table", idx);
+  if (tableStart === -1) return null;
+
+  // Take a generous slice until the end; the wrapper will constrain width anyway.
+  // We try to end around the TradingView footer area if present.
+  const footerMarker = "}";
+  const footerIdx = fullHtml.indexOf(footerMarker, idx);
+
+  let end = -1;
+  if (footerIdx !== -1) {
+    // find a few closing </table> after footer
+    end = footerIdx;
+    for (let i = 0; i < 10; i++) {
+      const next = fullHtml.indexOf("</table>", end);
+      if (next === -1) break;
+      end = next + "</table>".length;
+    }
+  }
+
+  if (end !== -1) return fullHtml.slice(tableStart, end);
+
+  // fallback: just take a big chunk
+  return fullHtml.slice(tableStart);
+}
+
+/**
+ * Wrap the TradingView HTML fragment in a standalone HTML doc,
+ * add a watermark overlay, and constrain width to typical email width.
+ */
+function wrapForScreenshot_(tvHtmlFragment, watermarkText) {
+  const wm = escapeHtml_(watermarkText || "TIMEWAVES TRADING");
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { margin:0; background:#fff; z-index:9990; position:relative;}
+    .wrap { width: 600px; margin: 0 auto; background:#ffffff; }
+    .pad { padding: 12px; }
+    .watermark {
+      position: fixed; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      font: 800 52px Arial, sans-serif;
+      color: rgba(0,0,0,0.12);
+      transform: rotate(-40deg);
+      pointer-events: none;
+      z-index: 999999999;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .warning-bar {
+    visibility: hidden;
+    }
+    /* Make images behave nicely */
+    img { max-width: 100%; height: auto; }
+  </style>
+  <script>
+    top.getElementById('warning').style.display = 'none';
+  </script>
+</head>
+<body>
+  <div class="watermark">${wm}</div>
+  <div class="pad">
+    <div id="capture" class="wrap">
+      ${tvHtmlFragment || ""}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function saveHtmlToDrive_(html, subject) {
+  const folder = getOrCreateFolder_("TV_Screenshot_POC_HTML");
+  const safeName = sanitizeFilename_(subject).slice(0, 80) || "tradingview-alert";
+  const filename = `${safeName}-${Date.now()}.html`;
+  const file = folder.createFile(filename, html, MimeType.HTML);
+  return file.getId();
+}
+
+function getOrCreateFolder_(name) {
+  const it = DriveApp.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  return DriveApp.createFolder(name);
+}
+
+function sanitizeFilename_(s) {
+  return String(s || "")
+    .replace(/[\\\/:*?"<>|]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function escapeHtml_(s) {
+  return (s || "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[c]));
+}
